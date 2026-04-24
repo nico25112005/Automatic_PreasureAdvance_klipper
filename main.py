@@ -33,19 +33,84 @@ def smooth(y, k):
 # -----------------------------
 # Kern: Breite bestimmen (vektorisiert)
 # -----------------------------
+# def compute_width(array):
+#     # Gradient (ohne Overflow!)
+#     grad = array[:, 1:].astype(np.int16) - array[:, :-1].astype(np.int16)
+
+#     # stärkste positive & negative Kante
+#     high_gradient_at = np.argmax(grad, axis=1)
+#     low_gradient_at = np.argmin(grad, axis=1)
+
+#     # Breite
+#     width = np.abs(low_gradient_at - high_gradient_at)
+
+#     return width, high_gradient_at, low_gradient_at
 def compute_width(array):
-    # Gradient (ohne Overflow!)
+    height, width = array.shape
+
+    # Gradient (sauber)
     grad = array[:, 1:].astype(np.int16) - array[:, :-1].astype(np.int16)
+    grad_abs = np.abs(grad)
 
-    # stärkste positive & negative Kante
-    high_gradient_at = np.argmax(grad, axis=1)
-    low_gradient_at = np.argmin(grad, axis=1)
+    # Adaptiver Threshold (pro Bild)
+    threshold = np.percentile(grad_abs, 94)
 
-    # Breite
-    width = np.abs(low_gradient_at - high_gradient_at)
+    best_left = np.full(height, -1, dtype=int)
+    best_right = np.full(height, -1, dtype=int)
+    widths = np.zeros(height)
 
-    return width, high_gradient_at, low_gradient_at
+    for i in range(height):
+        row = grad[i]
 
+        # starke Kanten finden
+        pos_edges = np.where(row > threshold)[0]
+        neg_edges = np.where(row < -threshold)[0]
+
+        best_pair = None
+        best_width = None
+
+        for p in pos_edges:
+            # suche nächste negative Kante rechts
+            candidates = neg_edges[neg_edges > p]
+            if len(candidates) == 0:
+                continue
+
+            n = candidates[0]
+            w = n - p
+
+            # harte Filterung (extrem wichtig!)
+            if w < 5 or w > width // 2:
+                continue
+
+            # beste Breite wählen (hier: größte)
+            if best_width is None or w > best_width:
+                best_width = w
+                best_pair = (p, n)
+
+        if best_pair is not None:
+            best_left[i], best_right[i] = best_pair
+            widths[i] = best_width
+        else:
+            widths[i] = np.nan
+
+    # -----------------------------
+    # Stabilitätsfilter (über Zeilen)
+    # -----------------------------
+    def median_filter_1d(arr, k=9):
+        padded = np.pad(arr, (k//2, k//2), mode='edge')
+        return np.array([np.median(padded[i:i+k]) for i in range(len(arr))])
+
+    valid_mask = ~np.isnan(widths)
+
+    if np.any(valid_mask):
+        widths[valid_mask] = median_filter_1d(widths[valid_mask], k=9)
+
+    # fallback für NaNs (Interpolation)
+    nans = np.isnan(widths)
+    if np.any(~nans):
+        widths[nans] = np.interp(np.flatnonzero(nans), np.flatnonzero(~nans), widths[~nans])
+
+    return widths, best_left, best_right
 
 # -----------------------------
 # Visualisierung
@@ -64,6 +129,75 @@ def build_visualization(array, high_gradient_at, low_gradient_at):
 
     return vis
 
+def compute_valid_statistics(high_gradient_at, low_gradient_at, width_smooth):
+    left = np.minimum(high_gradient_at, low_gradient_at)
+    right = np.maximum(high_gradient_at, low_gradient_at)
+
+    widths = right - left
+
+    # Nur grundsätzlich sinnvolle Werte (>0)
+    base_mask = widths > 0
+    base_widths = widths[base_mask]
+
+    if len(base_widths) == 0:
+        return {
+            "width_std": 1e6,
+            "width_min": 0,
+            "width_max": 0,
+            "width_mean": 0,
+            "width_diff": 0,
+            "high_at_std": 1e6,
+            "low_at_std": 1e6,
+            "valid_ratio": 0.0,
+            "penalty": 100,
+        }
+
+    # 🔥 Referenz: typische Linienbreite
+    median_width = np.median(base_widths)
+
+    # 🔥 relative Abweichung (kein fixer Pixelwert!)
+    deviation = np.abs(widths - median_width) / median_width
+
+    # nur Werte zulassen, die nahe am Median sind
+    valid_mask = (base_mask) & (deviation < 0.4)  # 40% Toleranz
+
+    valid_width = width_smooth[valid_mask]
+    valid_high = high_gradient_at[valid_mask]
+    valid_low = low_gradient_at[valid_mask]
+
+    valid_ratio = len(valid_width) / len(width_smooth)
+
+    if len(valid_width) > 0:
+        width_std = float(np.std(valid_width))
+        width_min = float(np.min(valid_width))
+        width_max = float(np.max(valid_width))
+        width_mean = float(np.mean(valid_width))
+
+        high_at_std = float(np.std(valid_high))
+        low_at_std = float(np.std(valid_low))
+    else:
+        width_std = 1e6
+        width_min = 0
+        width_max = 0
+        width_mean = 0
+        high_at_std = 1e6
+        low_at_std = 1e6
+
+    # Penalty für fehlende Daten
+    penalty = (1 - valid_ratio) * 50
+
+    return {
+        "width_std": width_std,
+        "width_min": width_min,
+        "width_max": width_max,
+        "width_mean": width_mean,
+        "width_diff": width_max - width_min,
+        "high_at_std": high_at_std,
+        "low_at_std": low_at_std,
+        "valid_ratio": valid_ratio,
+        "penalty": penalty,
+    }
+
 
 def image_to_base64(image):
     buffer = io.BytesIO()
@@ -76,19 +210,21 @@ def annotate_analysis_image(image_path, high_gradient_at, low_gradient_at, width
     image = image.rotate(-90, expand=True)
     draw = ImageDraw.Draw(image)
 
+    height, width = np.asarray(image).shape[:2]
+
     left_min = int(np.minimum(high_gradient_at[min_idx], low_gradient_at[min_idx]))
     right_min = int(np.maximum(high_gradient_at[min_idx], low_gradient_at[min_idx]))
     left_max = int(np.minimum(high_gradient_at[max_idx], low_gradient_at[max_idx]))
     right_max = int(np.maximum(high_gradient_at[max_idx], low_gradient_at[max_idx]))
 
-    h = image.height
-    line_y_min = int(min_idx * image.height / len(width_smooth))
-    line_y_max = int(max_idx * image.height / len(width_smooth))
+    
+    line_y_min = int(min_idx * height / len(width_smooth))
+    line_y_max = int(max_idx * height / len(width_smooth))
 
     draw.rectangle([left_min, line_y_min - 2, right_min, line_y_min + 2], fill=(0, 255, 0))
     draw.rectangle([left_max, line_y_max - 2, right_max, line_y_max + 2], fill=(255, 0, 0))
-    draw.line([(0, line_y_min), (image.width, line_y_min)], fill=(0, 255, 0), width=1)
-    draw.line([(0, line_y_max), (image.width, line_y_max)], fill=(255, 0, 0), width=1)
+    draw.line([(0, line_y_min), (width, line_y_min)], fill=(0, 255, 0), width=1)
+    draw.line([(0, line_y_max), (width, line_y_max)], fill=(255, 0, 0), width=1)
 
     font = None
     try:
@@ -96,10 +232,24 @@ def annotate_analysis_image(image_path, high_gradient_at, low_gradient_at, width
     except Exception:
         font = ImageFont.load_default()
 
-    draw.text((10, 10), f'Min width row: {min_idx}', fill=(0, 255, 0), font=font)
-    draw.text((10, 30), f'Max width row: {max_idx}', fill=(255, 0, 0), font=font)
-    draw.text((10, 50), f'Min width value: {width_smooth[min_idx]:.2f}', fill=(255, 255, 255), font=font)
-    draw.text((10, 70), f'Max width value: {width_smooth[max_idx]:.2f}', fill=(255, 255, 255), font=font)
+    detection = np.zeros((height, width*2, 3), dtype=np.uint8)
+
+    left_edges = np.minimum(high_gradient_at, low_gradient_at)
+    right_edges = np.maximum(high_gradient_at, low_gradient_at)
+
+    for i in range(height):
+        l = left_edges[i]
+        r = right_edges[i]
+
+        # Schutz gegen Müllwerte
+        if r > l and (r - l) > 2:
+            if l >= 0 and r >= 0:
+                detection[i, l:r] = [255, 255, 255]
+
+    # Rechte Hälfte: Originalbild
+    detection[:, width:] = np.asarray(image)
+
+    image = Image.fromarray(detection)
 
     return image_to_base64(image)
 
@@ -313,9 +463,14 @@ def create_dashboard_html(results, width_plot_html, position_plot_html, high_edg
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write(html)
 
-
 def open_html_report(output_path):
     webbrowser.open_new_tab('file://' + os.path.abspath(output_path))
+
+def find_robust_min_max(width_smooth):
+    """Findet Min/Max Werte mit einfacher Original-Logik."""
+    min_idx = int(np.argmin(width_smooth))
+    max_idx = int(np.argmax(width_smooth))
+    return min_idx, max_idx
 
 
 # -----------------------------
@@ -323,7 +478,7 @@ def open_html_report(output_path):
 # -----------------------------
 def main():
     np.set_printoptions(threshold=np.inf, precision=2)
-    folder_path = "./img/Testimg/img2/"
+    folder_path = "C:\\Users\\nicob\\OneDrive\\Dokumente\\Programming\\Python\\Automatic_PreasureAdvance_klipper\\img\\Testimg\\Own\\test_height_100\\test_cut_lines\\"
     smooth_factor = 30
 
     image_files = sorted(
@@ -336,27 +491,41 @@ def main():
         image_path = os.path.join(folder_path, img)
         preasure_advance = np.float64(img.rsplit('.', 1)[0])
 
+        print(img)
+
         array = preprocess_image(image_path)
         width, high_gradient_at, low_gradient_at = compute_width(array)
-        width_smooth = smooth(width, smooth_factor)
+        width_smooth = smooth(width, smooth_factor).astype(int)
+        #high_gradient_at_smooth = smooth(high_gradient_at, smooth_factor).astype(int)
+        #low_gradient_at_smooth = smooth(low_gradient_at, smooth_factor).astype(int)
 
-        min_idx = int(np.argmin(width_smooth))
-        max_idx = int(np.argmax(width_smooth))
+        # Einfache Min/Max-Findung wie ganz am Anfang
+        min_idx, max_idx = find_robust_min_max(width_smooth)
         annotated_image = annotate_analysis_image(image_path, high_gradient_at, low_gradient_at, width_smooth, min_idx, max_idx)
 
-        width_std = float(width_smooth.std())
-        high_at_std = float(high_gradient_at.std())
-        low_at_std = float(low_gradient_at.std())
-        score = float(width_std + 0.5 * (width_smooth.max() - width_smooth.min()) + 0.25 * high_at_std + 0.25 * low_at_std)
+        stats = compute_valid_statistics(high_gradient_at, low_gradient_at, width_smooth)
+
+        width_std = stats["width_std"]
+        high_at_std = stats["high_at_std"]
+        low_at_std = stats["low_at_std"]
+
+        score = float(
+            width_std
+            + 0.5 * stats["width_diff"]
+            + 0.25 * high_at_std
+            + 0.25 * low_at_std
+            + stats["penalty"]
+        )
+
 
         result = {
             'name': img,
             'pressure': preasure_advance,
             'width_mean': float(width_smooth.mean()),
             'width_std': width_std,
-            'width_max': float(width_smooth.max()),
-            'width_min': float(width_smooth.min()),
-            'width_diff': float(width_smooth.max() - width_smooth.min()),
+            'width_max': float(width_smooth[max_idx]),
+            'width_min': float(width_smooth[min_idx]),
+            'width_diff': float(width_smooth[max_idx] - width_smooth[min_idx]),
             'width_max_pos': max_idx,
             'width_min_pos': min_idx,
             'high_at_mean': float(high_gradient_at.mean()),
@@ -396,9 +565,21 @@ def main():
 
     def describe_statistics(name, values):
         values = np.array(values, dtype=np.float64)
+
+        # NaN entfernen
+        values = values[~np.isnan(values)]
+
+        if len(values) == 0:
+            print(f"{name}: NO VALID DATA")
+            return
+
         print(
-            f"{name}: mean={values.mean():.2f}, std={values.std():.2f}, "
-            f"min={values.min():.2f}, max={values.max():.2f}, median={np.median(values):.2f}"
+            f"{name}: "
+            f"mean={values.mean():.2f}, "
+            f"std={values.std():.2f}, "
+            f"min={values.min():.2f}, "
+            f"max={values.max():.2f}, "
+            f"median={np.median(values):.2f}"
         )
 
     print("\n=== Statistik über alle Bilder ===")
